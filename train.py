@@ -22,6 +22,11 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import wandb
+
+# start a new experiment
+wandb.init(project="gaussian-splatting-model")
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -91,13 +96,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # TODO test mask backpropagation, understand ssim loss
         mask = gt_image.ge(1e-5)
-        gt_image = torch.masked_select(gt_image, mask)
-        image = torch.masked_select(image, mask)
 
-        Ll1 = l1_loss(image, gt_image)
-        #loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        loss = Ll1
+        Ll1 = l1_loss(torch.masked_select(image, mask), torch.masked_select(gt_image, mask))
+        Lssim = ssim(image, gt_image)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - Lssim)
         loss.backward()
+
+        wandb.log({"total": loss, "l1": Ll1, "d-simm": Lssim})
+
+        if iteration % 1000 == 0:
+            gt_image_np = gt_image.detach().cpu().numpy()
+            image_np    = image.detach().cpu().numpy()
+            print("///////////////", gt_image_np.shape, image_np.shape)
+
+            
+
+
 
         iter_end.record()
 
@@ -208,7 +222,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 3_000, 7_000, 15_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
