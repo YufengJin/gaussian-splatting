@@ -69,3 +69,19 @@ class MiniCam:
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
 
+class BigCamera(Camera):
+    def __init__(self,  colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask, depth, mask, frame_id,
+            image_name, uid, trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"):
+
+       super(BigCamera, self).__init__(colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
+                 image_name, uid, trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda")
+
+       self.depth = self.mask = None
+
+       if isinstance(depth, torch.Tensor):
+           self.depth = depth.to(self.data_device)
+
+       if isinstance(mask, torch.Tensor):
+           self.mask = mask.to(self.data_device)
+
+       self.frame_id = frame_id

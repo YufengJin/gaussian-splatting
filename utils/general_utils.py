@@ -11,9 +11,47 @@
 
 import torch
 import sys
-from datetime import datetime
 import numpy as np
 import random
+import cv2
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+def image_from_numpy_to_tensor(image):
+    if images.dtype == 'uint8':
+        images = np.clip(images.astype('float32')/255.0, 0., 1.)
+
+    tensor_images = torch.from_numpy(images)
+
+    if len(tensor_images.shape) == 3:
+        return tensor_images.permute(2, 0, 1)
+
+    else:
+        return tensor_images.unsqueeze(dim=-1).permute(2, 0, 1)
+
+
+def batch_images_from_numpy_to_tensor(images):
+    if images.dtype == 'uint8':
+        images = np.clip(images.astype('float32')/255.0, 0., 1.)
+
+    tensor_images = torch.from_numpy(images)
+
+    if len(tensor_images.shape) == 4:
+        return tensor_images.permute(0, 3, 1, 2)
+    else:
+        return tensor_images.unsqueeze(dim=-1).permute(0, 3, 1, 2)
+
+def convert_depth_to_rgb(image, vis=None):
+    colormap = plt.cm.viridis
+    image = (image-image.min())/(image.max()-image.min())
+
+    # colormapping
+    if vis == 'cv2':
+        return cv2.cvtColor(colormap(image).astype(np.float32), cv2.COLOR_BGR2RGB)
+
+    else:
+        return colormap(image).astype(np.float32)
+
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))

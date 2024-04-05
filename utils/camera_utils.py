@@ -16,6 +16,14 @@ from utils.graphics_utils import fov2focal
 
 WARNED = False
 
+def calculate_fov_from_K(camera_matrix, image_width, image_height):
+    fx = camera_matrix[0, 0]  # focal length along x-axis
+    fy = camera_matrix[1, 1]  # focal length along y-axis
+
+    fov_x = 2 * np.arctan(image_width / (2 * fx))
+    fov_y = 2 * np.arctan(image_height / (2 * fy))
+    return fov_x, fov_y
+
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
 
