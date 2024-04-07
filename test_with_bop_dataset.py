@@ -86,12 +86,33 @@ run = wandb.init(
     name="naive-GS-bop-datasets",
     # Track hyperparameters and run metadata
     settings=wandb.Settings(start_method="fork"),
-    #mode='disabled'
+    mode='disabled'
 )
 
+# seperate date into multi cluster
 
-gsRunner = GaussianSplatRunner(cfg, colors=rgbs, depths=depths, masks=masks, poses=camPoses, frame_ids=frameIds, K=K, wandb=run)
+# random select a=20 image for training
+idxs = np.random.permutation(camPoses.shape[0])[:20]
+rgbs_init = rgbs[idxs, ...]
+depths_init = depths[idxs, ...]
+masks_init = masks[idxs, ...]
+camPoses_init = camPoses[idxs, ...]
+frameIds_init = [frameIds[ids] for ids in idxs]
+
+gsRunner = GaussianSplatRunner(cfg, colors=rgbs_init, poses=camPoses_init, frame_ids=frameIds_init, K=K,depths= depths_init, masks=masks_init, wandb=run)
+
 
 gsRunner.train()
+for _ in range(100):
+    idxs = np.random.permutation(camPoses.shape[0])[:20]
+    rgbs_tmp = rgbs[idxs, ...]
+    depths_tmp = depths[idxs, ...]
+    masks_tmp = masks[idxs, ...]
+    camPoses_tmp = camPoses[idxs, ...]
+    frameIds_tmp = [frameIds[ids] for ids in idxs]
+
+    gsRunner.add_new_frames(colors = rgbs_tmp, poses=camPoses_tmp, frame_ids=frameIds_tmp, depths=depths_tmp, masks=masks_tmp)
+    
+    gsRunner.train()
 
 

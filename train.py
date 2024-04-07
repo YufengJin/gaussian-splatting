@@ -107,9 +107,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gt_image_np = gt_image.detach().cpu().numpy()
             image_np    = image.detach().cpu().numpy()
-            print("///////////////", gt_image_np.shape, image_np.shape)
-
-            
 
 
 

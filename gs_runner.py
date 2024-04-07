@@ -12,6 +12,7 @@
 import os
 import sys
 import torch
+import io
 import copy
 import numpy as np
 import uuid
@@ -22,11 +23,12 @@ import open3d as o3d
 import hashlib
 import random
 import yaml
+import matplotlib.pyplot as plt
 from random import randint
 from utils.loss_utils import l1_loss, ssim, l2_loss
 from gaussian_renderer import render, network_gui
 from scene import Scene, GaussianModel, BigCamera
-from utils.general_utils import safe_state, convert_depth_to_rgb, batch_images_from_numpy_to_tensor, image_from_numpy_to_tensor
+from utils.general_utils import safe_state, convert_depth_to_rgb, batch_images_from_numpy_to_tensor, image_from_numpy_to_tensor, get_img_from_fig
 from tqdm import tqdm
 from utils.camera_utils import calculate_fov_from_K
 from utils.image_utils import psnr
@@ -35,11 +37,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams, GroupParams
 from open3d.geometry import PointCloud
 from pdb import set_trace
-def get_camTransfrom_from_glpose(pose):
-    c2w = pose.copy()
-    c2w[:3, 1:3] *= -1
-    w2c = np.linalg.inv(c2w)
-    return np.transpose(w2c[:3,:3]), w2c[:3, 3]
+
 
 # TODO learning gaussian in unit coordinate or world coordiate, test on blender data
 class ConfigParams:
@@ -77,8 +75,14 @@ class GaussianSplatRunner:
 
         return {"translate": translate, "radius": radius}
 
+    @staticmethod
+    def get_camTransfrom_from_glpose(pose):
+        c2w = pose.copy()
+        c2w[:3, 1:3] *= -1
+        w2c = np.linalg.inv(c2w)
+        return np.transpose(w2c[:3,:3]), w2c[:3, 3]
 
-    def __init__(self, cfg, colors=None, depths=None, masks=None, poses=None, frame_ids=None, K=None, point_cloud=None, wandb_run=None, *args, **kwargs):
+    def __init__(self, cfg, colors=None, poses=None, frame_ids=None, K=None, depths=None, masks=None, point_cloud=None, wandb_run=None, *args, **kwargs):
         # load cfg
         self.cfg = cfg
 
@@ -101,11 +105,13 @@ class GaussianSplatRunner:
 
         # cameras offset
         self._cameras_translate = self._cameras_radius = None
-        self._first_iter = 0
 
         # wandb logger
         if wandb is not None:
             self.wandb_run =  wandb_run
+
+        # initialize tqdm bar
+        self._bar = None
 
         # load from dataset
         is_group_params = all(var in kwargs.keys() for var in ['dataset', 'opt', 'pipe'])
@@ -157,7 +163,7 @@ class GaussianSplatRunner:
         self.fovX, self.fovY = calculate_fov_from_K(K, image_width, image_height)
 
         for (color, depth, mask, pose, frame_id) in zip(colors, depths, masks, poses, frame_ids):
-            R, T = get_camTransfrom_from_glpose(pose)
+            R, T = self.get_camTransfrom_from_glpose(pose)
              
             hash_object = hashlib.sha256(str(frame_id).encode())
             key = hash_object.hexdigest()
@@ -169,12 +175,17 @@ class GaussianSplatRunner:
 
         self._update_camera_extent()
         
+        msg = f"INFO: GS Initialization done. {len(list(self.viewpointsForTrainDict.keys()))} new frames added, "
         # create gaussian model
         if point_cloud is not None:
             self._create_gaussian_model_from_pcd(point_cloud)
+            msg += "point cloud is provided, GS starts from a point cloud"
 
         else:
             self._create_gaussian()
+            msg += "point cloud is not provided, GS starts from scratch"
+
+        print(msg)
 
     def _create_all_from_GroupParams(self, kwargs):
         dataset = kwargs.pop('dataset')
@@ -195,7 +206,7 @@ class GaussianSplatRunner:
             checkpoint = kwargs.pop('checkpoint')
             if not os.path.exists(checkpoint):
                 raise Exception(f"ERROR: CHECKPOINT PATH ERROR, {checkpoint} does not exist")
-            (model_params, self._first_iter) = torch.load(checkpoint)
+            (model_params, self._iter) = torch.load(checkpoint)
             self.gaussians.restore(model_params, opt)
 
         if "start_pcd" in kwargs.keys():
@@ -270,7 +281,7 @@ class GaussianSplatRunner:
         self.gaussians.training_setup(self.opt)
 
         # reset first iter
-        self._first_iter = 0
+        self._iter = 1 
 
 
     def _create_gaussian_model_from_pcd(self, pcd: PointCloud):
@@ -308,7 +319,7 @@ class GaussianSplatRunner:
         self.gaussians.training_setup(self.opt)
         
         # reset first iter
-        self._first_iter = 0
+        self._iter = 1 
 
     def load_gaussian_from_ply(self, plyfn):
         assert os.path.isfile(plyfn), "There is no input.ply"
@@ -319,8 +330,7 @@ class GaussianSplatRunner:
             print("WARNING: Gaussian Model Load from PLY failed. Start to create a basis Gaussian Model")
             self._create_gaussian()
 
-
-    def add_new_frames(self, colors, poses, frame_id, depths=None, masks=None, new_pcd=None, reuse_gaussian=False):
+    def add_new_frames(self, colors, poses, frame_ids, depths=None, masks=None, new_pcd=None, reuse_gaussian=True):
         get_new_datas = all(data is not None for data in [colors, poses, frame_ids])
         if not get_new_datas:
             print("WARNING: No New DATAs are provided. colors, poses, and frame_ids must be provided")
@@ -333,7 +343,6 @@ class GaussianSplatRunner:
         # images to Tensor
         colors = colors[:, ::down_scale_ratio, ::down_scale_ratio, :]
         colors = batch_images_from_numpy_to_tensor(colors).to(self.device)
-
 
         if depths is not None:
             depths = depths[:, ::down_scale_ratio, ::down_scale_ratio]
@@ -348,11 +357,12 @@ class GaussianSplatRunner:
         else:
             masks = [None for _ in range(self.frameCnt)]
 
-        if not self.K: 
+        if self.K is None: 
             print("ERROR: Camera intrinsic has not been set up, add_new_frames failed.")
+            return
 
         for (color, depth, mask, pose, frame_id) in zip(colors, depths, masks, poses, frame_ids):
-            R, T = get_camTransfrom_from_glpose(pose)
+            R, T = self.get_camTransfrom_from_glpose(pose)
             #R = pose[:3, :3]
             #T = pose[:3, 3]
              
@@ -366,29 +376,36 @@ class GaussianSplatRunner:
 
         self._update_camera_extent()
 
-        print(f"INFO: {newImagesCnt} new frames added, total {len(self.viewpointsForTrainDict.keys())} frames")
+        msg = f"INFO: {newImagesCnt} new frames added, total {len(self.viewpointsForTrainDict.keys())} frames"
 
         if not reuse_gaussian:
             if new_pcd is None:
                 self._create_gaussian()
+                msg += ", restart training"
             else:
                 self._create_gaussian_model_from_pcd(new_pcd)
+                msg += ", restart training from provided point clouds"
+        else:
+            msg += " Reusing the GS, continue training"
+
+        print(msg)
 
     def _create_optimizer(self):
         # TODO optimize camera pose and gaussian model in parallel 
         pass
 
-    def train(self):
-        iter_start = torch.cuda.Event(enable_timing = True)
-        iter_end = torch.cuda.Event(enable_timing = True)
+    def train(self, once_iterations=30000):
         ema_loss_for_log = 0.0
-        first_iter = self._first_iter
 
-        progress_bar = tqdm(range(first_iter, self.opt.iterations), desc="Training progress")
-        first_iter += 1
+        iteration = self._iter
 
-        for iteration in range(first_iter, self.opt.iterations + 1):
-            iter_start.record()
+        if self._bar is None:
+            self._bar = tqdm(range(iteration, self.opt.iterations+1), desc="Training progress")
+
+        for _ in range(once_iterations):
+            if self._iter == self.opt.iterations:
+                print(f"INFO: Training completely finished after {self.opt.iteration} iterations")
+                return
 
             self.gaussians.update_learning_rate(iteration)
 
@@ -438,9 +455,6 @@ class GaussianSplatRunner:
                 if depth_gt is not None:
                     Ll2 = l2_loss(depth, depth_gt)
 
-            #Ll2 = l2_loss(depth, depth_gt)
-
-
             Lssim = 1.0 - ssim(image, gt_image)
             loss = (1.0 - self.opt.lambda_dssim) * Ll1 + self.opt.lambda_dssim * Lssim + Ll2
             
@@ -449,32 +463,35 @@ class GaussianSplatRunner:
             # TODO backward every 10 frames
             loss.backward()
 
-            if self.debug:
-                import matplotlib.pyplot as plt
-                if iteration % 10 == 0:
-                    fig = plt.figure(figsize=(20, 10), dpi=200)
 
-                    plt.subplot(1, 2, 1); plt.imshow(depth.detach().cpu().squeeze().numpy()); plt.colorbar()
-                    plt.subplot(1, 2, 2); plt.imshow(depth_gt.detach().cpu().squeeze().numpy()); plt.colorbar()
-                    
-                    fig.canvas.draw()
+            if self.debug:
+                if iteration % 10 == 0:
+                    fig = plt.figure(figsize=(20,10))
+                    plt.subplot(1, 2, 1); plt.imshow(depth.detach().cpu().squeeze().numpy()); plt.colorbar(); plt.axis('off'); plt.title('Rendered Depth')
+                    plt.subplot(1, 2, 2); plt.imshow(depth_gt.detach().cpu().squeeze().numpy()-depth.detach().cpu().squeeze().numpy()); plt.colorbar(); plt.axis('off'); plt.title('Depth diff')
+                    data = get_img_from_fig(fig)
 
                     # Now we can save it to a numpy array.
-                    data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-                    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+                    #data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                    #data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+
+                    plt.close()
 
                     gt_image_np = gt_image.detach().cpu().numpy().transpose(1, 2, 0)
                     image_np    = image.detach().cpu().numpy().transpose(1, 2, 0)
                     gt_image_np = (gt_image_np * 255).astype(np.uint8)
                     image_np = (image_np * 255).astype(np.uint8)
+
                     #depth_np = (convert_depth_to_rgb(depth.detach().cpu().squeeze().numpy(), vis='cv2') * 255).astype(np.uint8)[..., :3]
                     #depth_gt_np = (convert_depth_to_rgb(depth_gt.detach().cpu().squeeze().numpy(), vis='cv2') * 255).astype(np.uint8)[..., :3]
-
                     #depths = np.hstack((depth_gt_np,  depth_np))
+
                     images = np.hstack((gt_image_np, image_np))
+                    images = cv2.cvtColor(images, cv2.COLOR_BGR2RGB)
                     size = images.shape[:2][::-1]
                     resized_depths = cv2.resize(data, size)
                     images = np.vstack((images, resized_depths))
+                    # TODO memory leak due cv2.imshow
                     cv2.imshow("Diff", images)
 
                     # Check for key press
@@ -482,14 +499,17 @@ class GaussianSplatRunner:
                     if key == ord('q'):  # Press 'q' to quit
                         break
 
+            del depth, depth_gt, gt_image, image, mask
+            torch.cuda.empty_cache()
+
             with torch.no_grad():
                 # Progress bar
                 ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                 if iteration % 10 == 0:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-                    progress_bar.update(10)
+                    self._bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                    self._bar.update(10)
                 if iteration == self.opt.iterations:
-                    progress_bar.close()
+                    self._bar.close()
 
                 # save
                 if (iteration in self.opt.save_pcd_iterations):
@@ -518,6 +538,11 @@ class GaussianSplatRunner:
                 if (iteration in self.opt.save_ck_iterations):
                     print("\n[ITER {}] Saving Checkpoint".format(iteration))
                     torch.save((self.gaussians.capture(), iteration), self.opt.save_path + "/checkpoint_" + str(iteration) + ".pth")
+
+            iteration += 1
+
+        # update iteration
+        self._iter = iteration
 
     
 
