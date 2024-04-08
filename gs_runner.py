@@ -465,7 +465,7 @@ class GaussianSplatRunner:
 
 
             if self.debug:
-                if iteration % 10 == 0:
+                if iteration % 50 == 0:
                     fig = plt.figure(figsize=(20,10))
                     plt.subplot(1, 2, 1); plt.imshow(depth.detach().cpu().squeeze().numpy()); plt.colorbar(); plt.axis('off'); plt.title('Rendered Depth')
                     plt.subplot(1, 2, 2); plt.imshow(depth_gt.detach().cpu().squeeze().numpy()-depth.detach().cpu().squeeze().numpy()); plt.colorbar(); plt.axis('off'); plt.title('Depth diff')
@@ -491,13 +491,20 @@ class GaussianSplatRunner:
                     size = images.shape[:2][::-1]
                     resized_depths = cv2.resize(data, size)
                     images = np.vstack((images, resized_depths))
-                    # TODO memory leak due cv2.imshow
-                    cv2.imshow("Diff", images)
+                    # live show
+                    if False:
+                        cv2.imshow("Diff", images)
 
-                    # Check for key press
-                    key = cv2.waitKey(30) & 0xFF
-                    if key == ord('q'):  # Press 'q' to quit
-                        break
+                        # Check for key press
+                        key = cv2.waitKey(30) & 0xFF
+                        if key == ord('q'):  # Press 'q' to quit
+                            break
+                      
+                    else:
+                        fn = f"debug_images/image_iter_{iteration:06d}.jpg"
+                        cv2.imwrite(fn, images)
+
+
 
             del depth, depth_gt, gt_image, image, mask
             torch.cuda.empty_cache()
