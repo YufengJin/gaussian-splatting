@@ -141,7 +141,7 @@ for pose in camPoses:
 
 
 
-o3d.visualization.draw([frame, nerfCamFrames, bopCamFrames])
+o3d.visualization.draw([frame, nerfCamFrames, glCamFrames, camFrames, bopCamFrames])
 
 
 
