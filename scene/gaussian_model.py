@@ -146,6 +146,22 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    def deactivate_grad(self):
+        self._xyz.requires_grad_(False)
+        self._features_dc.requires_grad_(False)
+        self._features_rest.requires_grad_(False)
+        self._opacity.requires_grad_(False)
+        self._scaling.requires_grad_(False)
+        self._rotation.requires_grad_(False)
+
+    def activate_grad(self):
+        self._xyz.requires_grad_(True)
+        self._features_dc.requires_grad_(True)
+        self._features_rest.requires_grad_(True)
+        self._opacity.requires_grad_(True)
+        self._scaling.requires_grad_(True)
+        self._rotation.requires_grad_(True)
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -166,25 +182,7 @@ class GaussianModel:
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
 
-    def training_cfg_setup(self, cfg):
-        self.percent_dense = cfg["percent_dense"]
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        l = [
-            {'params': [self._xyz], 'lr': cfg["position_lr_init"] * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._features_dc], 'lr': cfg["feature_lr"], "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': cfg["feature_lr"] / 20.0, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': cfg["opacity_lr"], "name": "opacity"},
-            {'params': [self._scaling], 'lr': cfg["scaling_lr"], "name": "scaling"},
-            {'params': [self._rotation], 'lr': cfg["rotation_lr"], "name": "rotation"}
-        ]
-
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        self.xyz_scheduler_args = get_expon_lr_func(lr_init=cfg["position_lr_init"]*self.spatial_lr_scale,
-                                                    lr_final=cfg["position_lr_final"]*self.spatial_lr_scale,
-                                                    lr_delay_mult=cfg["position_lr_delay_mult"],
-                                                    max_steps=cfg["position_lr_max_steps"])
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:

@@ -9,7 +9,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 
 # load from bop dataset
-dataRootDir = '/home/yjin/repos/BlenderProc/examples/datasets/bop_object_pose_sampling/output/bop_data/ycbv/train_pbr/000000'
+dataRootDir = './bop_outputs/bop_data/ycbv/train_pbr/000000'
 
 cameraInfo = json.load(open(dataRootDir + '/scene_camera.json', 'r'))
 
@@ -46,10 +46,6 @@ for key, content in cameraPoses.items():
     cam_pose[:3, 3] /= 1000.
     camPoses.append(cam_pose)
 
-    # load rgb, depth
-    fn = os.path.join(dataRootDir, 'rgb', f'{imgId:06d}.jpg')
-    color = Image.open(fn)
-    rgbs.append(np.asarray(color, dtype=np.uint8))
 
     fn = os.path.join(dataRootDir, 'depth', f'{imgId:06d}.png')
     depth = imageio.imread(fn)
@@ -59,6 +55,13 @@ for key, content in cameraPoses.items():
     fn = os.path.join(dataRootDir, 'mask', f'{imgId:06d}_000000.png')
     mask = Image.open(fn)
     masks.append(np.asarray(mask))
+
+    # load rgb, depth
+    fn = os.path.join(dataRootDir, 'rgb', f'{imgId:06d}.jpg')
+    color = np.asarray(Image.open(fn), dtype=np.uint8).copy()
+
+    color[np.logical_not(mask)] = [0, 0, 0]
+    rgbs.append(color)
 
 
 camPoses = np.asarray(camPoses)
@@ -79,20 +82,25 @@ masks = np.asarray(masks)
 cfg = yaml.safe_load(open('gs_runner_config.yml', 'r'))
 
 import wandb
+
+if cfg['use_wandb']:
+    wand_mode = 'online'
+else:
+    wand_mode = 'disabled'
 wandb.login()
 run = wandb.init(
     # Set the project where this run will be logged
     project="Gaussian Splatting Analysis",
-    name="naive-GS-bop-datasets",
+    name="naive-GS-bop-datasets-new-render",
     # Track hyperparameters and run metadata
     settings=wandb.Settings(start_method="fork"),
-    mode='disabled'
+    mode=wand_mode
 )
 
 # seperate date into multi cluster
-
 # random select a=20 image for training
-idxs = np.random.permutation(camPoses.shape[0])[:20]
+
+idxs = np.random.permutation(camPoses.shape[0])[:]
 rgbs_init = rgbs[idxs, ...]
 depths_init = depths[idxs, ...]
 masks_init = masks[idxs, ...]
@@ -103,16 +111,16 @@ gsRunner = GaussianSplatRunner(cfg, colors=rgbs_init, poses=camPoses_init, frame
 
 
 gsRunner.train()
-for _ in range(100):
-    idxs = np.random.permutation(camPoses.shape[0])[:20]
-    rgbs_tmp = rgbs[idxs, ...]
-    depths_tmp = depths[idxs, ...]
-    masks_tmp = masks[idxs, ...]
-    camPoses_tmp = camPoses[idxs, ...]
-    frameIds_tmp = [frameIds[ids] for ids in idxs]
-
-    gsRunner.add_new_frames(colors = rgbs_tmp, poses=camPoses_tmp, frame_ids=frameIds_tmp, depths=depths_tmp, masks=masks_tmp)
-    
-    gsRunner.train()
+#for _ in range(100):
+#    idxs = np.random.permutation(camPoses.shape[0])[:20]
+#    rgbs_tmp = rgbs[idxs, ...]
+#    depths_tmp = depths[idxs, ...]
+#    masks_tmp = masks[idxs, ...]
+#    camPoses_tmp = camPoses[idxs, ...]
+#    frameIds_tmp = [frameIds[ids] for ids in idxs]
+#
+#    gsRunner.add_new_frames(colors = rgbs_tmp, poses=camPoses_tmp, frame_ids=frameIds_tmp, depths=depths_tmp, masks=masks_tmp)
+#    
+#    gsRunner.train()
 
 

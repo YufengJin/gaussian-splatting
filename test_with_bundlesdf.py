@@ -5,13 +5,7 @@ import yaml
 import cv2
 import open3d as o3d
 import matplotlib.pyplot as plt
-from gs_runner import GaussianSplatRunner
-
-def from_nerf_to_gs(pose):
-    mat = pose.copy()
-    transform = np.eye(4)
-    transform[:2, :2] = np.array([[0, -1.], [1. , 0.]])
-    return mat@transform
+from gs_runner_old import GaussianSplatRunner
 
 # load all .npy
 folder_path = '/home/yjin/repos/BundleSDF/final_datas' 
@@ -39,15 +33,14 @@ wandb.login()
 run = wandb.init(
     # Set the project where this run will be logged
     project="Gaussian Splatting Analysis",
-    name="naive-GS-bundlesdf-datasets",
+    name="naive-GS-bundlesdf-datasets-new-renderer",
     # Track hyperparameters and run metadata
     settings=wandb.Settings(start_method="fork"),
-    mode='disabled'
+    #mode='disabled'
 )
 
 
 frameIds = [f'{i:03d}' for i in range(rgbs.shape[0])]
-#poses = np.asarray([from_nerf_to_gs(pose) for pose in glcam_in_obs])
 
 def rgbd_to_pointcloud(rgb_image, depth_image, K):
     fx = K[0][0]
@@ -73,8 +66,6 @@ def rgbd_to_pointcloud(rgb_image, depth_image, K):
 
     return pcd
 
-# TODO validate the function 'from_nerf_to_gs'
-# TODO create pointCloud from RGBD
 def display_inlier_outlier(cloud, ind):
     inlier_cloud = cloud.select_by_index(ind)
     outlier_cloud = cloud.select_by_index(ind, invert=True)
@@ -89,7 +80,7 @@ def preprocess_datas(rgbs, depths, masks, glcam_in_obs):
     for (color, depth, mask, pose) in zip(rgbs, depths, masks, glcam_in_obs):
         # mask erosion
         mask_uint = mask.astype(np.uint8)
-        kernel = np.ones((25,25), np.uint8)  # You can adjust the kernel size as needed
+        kernel = np.ones((30,30), np.uint8)  # You can adjust the kernel size as needed
     
         # Perform erosion
         eroded_mask = cv2.erode(mask_uint, kernel, iterations=1)
@@ -124,8 +115,11 @@ def preprocess_datas(rgbs, depths, masks, glcam_in_obs):
     
     
     pcdAll = pcdAll.voxel_down_sample(voxel_size=0.01)
-    cl, ind = pcdAll.remove_statistical_outlier(nb_neighbors=20,
-                                                    std_ratio=2.0)
+    #cl, ind = pcdAll.remove_statistical_outlier(nb_neighbors=100,
+    #                                                std_ratio=1.0)
+    cl, ind = pcdAll.remove_radius_outlier(nb_points=20, radius=0.02)
+
+    display_inlier_outlier(pcdAll, ind)
     
     pcdAll = pcdAll.select_by_index(ind)
     #o3d.visualization.draw_geometries([pcdAll])
@@ -137,7 +131,7 @@ def preprocess_datas(rgbs, depths, masks, glcam_in_obs):
 pcdAll = preprocess_datas(rgbs, depths, masks, glcam_in_obs)
 
 #gsRunner = GaussianSplatRunner(cfg, colors=rgbs, depths=depths, masks=masks, poses=glcam_in_obs, frame_ids=frameIds, K=K, point_cloud=pcdAll, wandb=run)
-gsRunner = GaussianSplatRunner(cfg, colors=rgbs, depths=depths, masks=masks, poses=glcam_in_obs, frame_ids=frameIds, K=K,  wandb=run)
+gsRunner = GaussianSplatRunner(cfg, colors=rgbs, depths=depths, masks=masks, poses=glcam_in_obs, frame_ids=frameIds, K=K, wandb=run)
 
 gsRunner.train()
 

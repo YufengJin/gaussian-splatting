@@ -26,7 +26,7 @@ for j, obj in enumerate(bop_objs):
 # sample point light on shell
 light_point = bproc.types.Light()
 light_point.set_type('SPOT')
-light_point.set_energy(100)
+light_point.set_energy(500)
 location = bproc.sampler.shell(center=[0, 0, -0.8], radius_min=1, radius_max=2,
                                elevation_min=40, elevation_max=89, uniform_volume=False)
 light_point.set_location(location)
@@ -42,14 +42,14 @@ def sample_pose_func(obj: bproc.types.MeshObject):
 bproc.renderer.enable_depth_output(activate_antialiasing=False)
 bproc.renderer.set_max_amount_of_samples(50)
 
-color = [0., 0., 0.]
-bproc.renderer.set_world_background(color, strength=0.5)
+#color = [0., 0., 0.]
+#bproc.renderer.set_world_background(color, strength=.2)
 # add segmentation masks (per class and per instance)
 bproc.renderer.enable_segmentation_output(map_by=["category_id", "instance", "name", "bop_dataset_name"],
                                           default_values={"category_id": 0, "bop_dataset_name": None})
 
 # Render five different scenes
-for _ in range(25):
+for _ in range(10):
 
     # Sample object poses and check collisions 
     #bproc.object.sample_poses(objects_to_sample=bop_objs,
@@ -61,7 +61,7 @@ for _ in range(25):
 
     poses = 0
     # Render two camera poses
-    while poses < 2:
+    while poses < 5:
         # Sample location
         location = bproc.sampler.shell(center=[0, 0, 0],
                                        radius_min=1,

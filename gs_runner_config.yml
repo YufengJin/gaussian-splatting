@@ -3,8 +3,8 @@ gaussians_model:
 
 train:
   iterations: 30_000
-  position_lr_init: 0.00016
-  position_lr_final: 0.0000016
+  position_lr_init: 0.000016                 #0.00016      
+  position_lr_final: 0.00000016                        #0.0000016
   position_lr_delay_mult: 0.01
   position_lr_max_steps: 30_000
   feature_lr: 0.0025
@@ -35,6 +35,7 @@ pipeline:
   compute_cov3D_python: False
 
 use_octree: False
+use_wandb: False 
 device: 'cuda:0'
 white_background: False
 debug: True 
