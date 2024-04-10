@@ -25,8 +25,8 @@ for j, obj in enumerate(bop_objs):
 
 # sample point light on shell
 light_point = bproc.types.Light()
-light_point.set_type('SPOT')
-light_point.set_energy(500)
+light_point.set_type('AREA')
+light_point.set_energy(5)
 location = bproc.sampler.shell(center=[0, 0, -0.8], radius_min=1, radius_max=2,
                                elevation_min=40, elevation_max=89, uniform_volume=False)
 light_point.set_location(location)

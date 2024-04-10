@@ -39,31 +39,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams, GroupParams
 from open3d.geometry import PointCloud
 from pdb import set_trace
-
-def setup_camera(w, h, k, w2c, near=0.01, far=100, bg=[0, 0, 0], requires_grad=True):
-    fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
-    w2c = torch.tensor(w2c).cuda().float()
-    cam_center = torch.inverse(w2c)[:3, 3]
-    w2c = w2c.unsqueeze(0).transpose(1, 2).requires_grad_(True)
-    opengl_proj = torch.tensor([[2 * fx / w, 0.0, -(w - 2 * cx) / w, 0.0],
-                                [0.0, 2 * fy / h, -(h - 2 * cy) / h, 0.0],
-                                [0.0, 0.0, far / (far - near), -(far * near) / (far - near)],
-                                [0.0, 0.0, 1.0, 0.0]]).cuda().float().unsqueeze(0).transpose(1, 2)
-    full_proj = w2c.bmm(opengl_proj)
-    cam = Camera(
-        image_height=h,
-        image_width=w,
-        tanfovx=w / (2 * fx),
-        tanfovy=h / (2 * fy),
-        bg=torch.tensor(bg, dtype=torch.float32, device="cuda"),
-        scale_modifier=1.0,
-        viewmatrix=w2c,
-        projmatrix=full_proj,
-        sh_degree=0,
-        campos=cam_center,
-        prefiltered=False
-    )
-    return cam
+from pytorch3d.transforms import matrix_to_quaternion, quaternion_to_matrix
 
 # TODO learning gaussian in unit coordinate or world coordiate, test on blender data
 class ConfigParams:
@@ -72,7 +48,7 @@ class ConfigParams:
         
 class GaussianSplatRunner:
     @classmethod
-    def getNerfppNorm(cls, cam_info):
+    def getNerfppNorm(cls, w2cList):
         """
         This is a function to approximate the center offset and radius of cameras.
 
@@ -89,8 +65,7 @@ class GaussianSplatRunner:
 
         cam_centers = []
 
-        for cam in cam_info:
-            W2C = cam.viewmatrix.detach().cpu().numpy()
+        for W2C in w2cList:
             C2W = np.linalg.inv(W2C)
             cam_centers.append(C2W[:3, 3:4])
 
@@ -100,13 +75,23 @@ class GaussianSplatRunner:
         translate = -center
 
         return {"translate": translate, "radius": radius}
-
+    
     @staticmethod
-    def get_camTransfrom_from_glpose(pose):
-        c2w = pose.copy()
-        c2w[:3, 1:3] *= -1
-        w2c = np.linalg.inv(c2w)
-        return np.transpose(w2c[:3,:3]), w2c[:3, 3]
+    def c2w_to_w2c(cam_quat, cam_t):
+        assert cam_quat.shape[0] == cam_t.shape[0], 'Error: batch size of camera quaternion does not match the batch size of camera trans'
+        batch_size = cam_quat.shape[0]
+
+        c2w = torch.eye(4).cuda()
+        c2w = c2w.unsqueeze(0).repeat(batch_size, 1, 1)
+
+
+        c2w[:, :3, :3] = quaternion_to_matrix(cam_quat)
+        c2w[:, :3, 3] = cam_t
+        c2w[:, :3, 1:3] *= -1
+
+        w2c = torch.inverse(c2w)
+        return w2c
+
 
     def __init__(self, cfg, colors=None, poses=None, frame_ids=None, K=None, depths=None, masks=None, point_cloud=None, wandb_run=None, *args, **kwargs):
         # load cfg
@@ -125,7 +110,7 @@ class GaussianSplatRunner:
 
         # initialize a empty gaussian models
         self.gaussians = GaussianModel(cfg["gaussians_model"]["sh_degree"])
-        self.datasForTrainList = [] 
+        self.allDatasForTrain = [] 
 
         self._cameras_opt_cnt = {}
 
@@ -135,7 +120,7 @@ class GaussianSplatRunner:
         self._down_scale_ratio = down_scale_ratio = int(cfg['down_scale_ratio'])
 
         bg_color = [1, 1, 1] if cfg['white_background'] else [0, 0, 0]
-        self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        self.background = torch.tensor(bg_color, dtype=torch.float32, device=self.device)
 
         # cameras offset
         self._cameras_translate = self._cameras_radius = None
@@ -195,26 +180,38 @@ class GaussianSplatRunner:
 
         self.K = K
 
+        datasForTrainList = []
         for (color, depth, mask, pose, frame_id) in zip(colors, depths, masks, poses, frame_ids):
+            c2w_quat = matrix_to_quaternion(torch.tensor(pose[:3, :3]).float())
+            c2w_t = torch.tensor(pose[:3, 3]).float()
+
+            # TODO remove later
             c2w = pose.copy()
             c2w[:3, 1:3] *= -1
             w2c = np.linalg.inv(c2w)
 
-            cam = setup_camera(self.image_width, self.image_height, self.K, w2c)
+            cam = self.setup_camera(w2c)
 
+            # w2c, c2w numpy
             cur_data = {
                     'color': color,
                     'depth': depth,
                     'mask' : mask,
                     'cam'  : cam,
                     'frame_id' : frame_id,
-                    'w2c': w2c
+                    'w2c' : w2c,
+                    'c2w_quat': c2w_quat, 
+                    'c2w_t': c2w_t,
+                    'opt_cnt' : 0
                     }
-            self.datasForTrainList.append(cur_data)
+
+            datasForTrainList.append(cur_data)
+
+        self.allDatasForTrain += datasForTrainList
 
         self._update_camera_extent()
         
-        msg = f"INFO: GS Initialization done. {len(self.datasForTrainList)} new frames added, "
+        msg = f"INFO: GS Initialization done. {len(self.allDatasForTrain)} new frames added, "
         # create gaussian model
         if point_cloud is not None:
             self._create_gaussian_model_from_pcd(point_cloud)
@@ -226,7 +223,68 @@ class GaussianSplatRunner:
 
         print(msg)
 
-    
+    def create_camera(self, w2c, near=0.01, far=100, bg=[0, 0, 0]):
+        k = self.K
+        fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
+        w, h = self.image_width, self.image_height
+
+        if len(w2c.shape) == 2:
+            cam_center = torch.inverse(w2c)[:3, 3]
+            w2c = w2c.unsqueeze(0).transpose(1, 2)
+        else:
+            w2c = w2c.transpose(1, 2)
+            cam_center = torch.inverse(w2c)[:, :3, 3]
+
+        opengl_proj = torch.tensor([[2 * fx / w, 0.0, -(w - 2 * cx) / w, 0.0],
+                                    [0.0, 2 * fy / h, -(h - 2 * cy) / h, 0.0],
+                                    [0.0, 0.0, far / (far - near), -(far * near) / (far - near)],
+                                    [0.0, 0.0, 1.0, 0.0]]).cuda().float().unsqueeze(0).transpose(1, 2)
+        full_proj = w2c.bmm(opengl_proj)
+        cam = Camera(
+            image_height=h,
+            image_width=w,
+            tanfovx=w / (2 * fx),
+            tanfovy=h / (2 * fy),
+            bg=torch.tensor(bg, dtype=torch.float32, device=self.device),
+            scale_modifier=1.0,
+            viewmatrix=w2c,
+            projmatrix=full_proj,
+            sh_degree=0,
+            campos=cam_center,
+            prefiltered=False
+        )
+        return cam
+
+    def setup_camera(self, w2c, near=0.01, far=100, bg=[0, 0, 0]):
+        k = self.K
+        fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
+        w, h = self.image_width, self.image_height
+
+        w2c = torch.tensor(w2c).cuda().float()
+        cam_center = torch.inverse(w2c)[:3, 3]
+        w2c = w2c.unsqueeze(0).transpose(1, 2)
+
+        cam_center = torch.inverse(w2c)[:3, 3]
+        opengl_proj = torch.tensor([[2 * fx / w, 0.0, -(w - 2 * cx) / w, 0.0],
+                                    [0.0, 2 * fy / h, -(h - 2 * cy) / h, 0.0],
+                                    [0.0, 0.0, far / (far - near), -(far * near) / (far - near)],
+                                    [0.0, 0.0, 1.0, 0.0]]).cuda().float().unsqueeze(0).transpose(1, 2)
+        full_proj = w2c.bmm(opengl_proj)
+        cam = Camera(
+            image_height=h,
+            image_width=w,
+            tanfovx=w / (2 * fx),
+            tanfovy=h / (2 * fy),
+            bg=torch.tensor(bg, dtype=torch.float32, device=self.device),
+            scale_modifier=1.0,
+            viewmatrix=w2c,
+            projmatrix=full_proj,
+            sh_degree=0,
+            campos=cam_center,
+            prefiltered=False
+        )
+        return cam
+
     def _create_all_from_GroupParams(self, kwargs):
         dataset = kwargs.pop('dataset')
         opt = kwargs.pop('opt')
@@ -237,7 +295,7 @@ class GaussianSplatRunner:
 
         # overwrite config background
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-        self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        self.background = torch.tensor(bg_color, dtype=torch.float32, device=self.device)
 
         # get camera stack [Camera], multi-res
         self._scene_load_viewpoints()
@@ -278,7 +336,7 @@ class GaussianSplatRunner:
             frame_id = str(viewpoint.uid)
             hash_object = hashlib.sha256(frame_id.encode())
             hash_code = hash_object.hexdigest()
-            self.datasForTrainList[hash_code] = viewpoint
+            self.allDatasForTrain[hash_code] = viewpoint
 
         if len(viewpoint_test_stack) > 0:
             for viewpoint in viewpoint_test_stack:
@@ -292,10 +350,10 @@ class GaussianSplatRunner:
 
     def _update_camera_extent(self):
         # get nerfnormalization
-        if list(self.datasForTrainList) == 0:
+        if list(self.allDatasForTrain) == 0:
             return
         else:
-            camera_extent = self.getNerfppNorm([data['cam'] for data in self.datasForTrainList])
+            camera_extent = self.getNerfppNorm([data['w2c'] for data in self.allDatasForTrain])
             self._cameras_translate = camera_extent['translate']
             self._cameras_radius = camera_extent['radius']
             return 1 
@@ -401,25 +459,39 @@ class GaussianSplatRunner:
             print("ERROR: Camera intrinsic has not been set up, add_new_frames failed.")
             return
 
+        datasForTrainList = []
         for (color, depth, mask, pose, frame_id) in zip(colors, depths, masks, poses, frame_ids):
+            c2w_quat = matrix_to_quaternion(torch.tensor(pose[:3, :3]).float())
+            c2w_t = torch.tensor(pose[:3, 3]).float()
+
+            # TODO remove later
             c2w = pose.copy()
             c2w[:3, 1:3] *= -1
             w2c = np.linalg.inv(c2w)
 
-            cam = setup_camera(self.image_width, self.image_height, self.K, w2c)
+            cam = self.setup_camera(w2c)
 
+            # w2c, c2w numpy
             cur_data = {
                     'color': color,
                     'depth': depth,
                     'mask' : mask,
                     'cam'  : cam,
-                    'frame_id' : frame_id
+                    'frame_id' : frame_id,
+                    'w2c' : w2c,
+                    'c2w_quat': c2w_quat, 
+                    'c2w_t': c2w_t,
+                    'opt_cnt' : 0
                     }
-            self.datasForTrainList.append(cur_data)
+            datasForTrainList.append(cur_data)
+
+        self.allDatasForTrain += datasForTrainList
+
+        self._update_camera_params(datasForTrainList)
 
         self._update_camera_extent()
 
-        msg = f"INFO: {newImagesCnt} new frames added, total {len(self.datasForTrainList)} frames"
+        msg = f"INFO: {newImagesCnt} new frames added, total {len(self.allDatasForTrain)} frames"
 
         if not reuse_gaussian:
             if new_pcd is None:
@@ -433,34 +505,56 @@ class GaussianSplatRunner:
 
         print(msg)
 
-    def train(self, once_iterations=30000):
+    def train(self, once_iterations=100_000):
         ema_loss_for_log = 0.0
 
         # TODO iter time: gaussian iteration, camera iterations
         # TODO train should start from gaussian optimization and after try to optimize camera
-        iteration = self._gs_iter
+
+        # create camera optimizer, optimize all camera frame
+        """
+        #camera_matrix is not differentiable through backward GaussianRasterization
+
+        c2w_quats = [data['c2w_quat'] for data in self.allDatasForTrain]
+        c2w_ts = [data['c2w_t'] for data in self.allDatasForTrain]
+
+        c2w_quats = torch.stack(c2w_quats, axis=0).float().to(self.device)
+        c2w_ts = torch.stack(c2w_ts, axis=0).float().to(self.device)
+        
+        #c2w_quats.requires_grad_(True)
+        #c2w_ts.requires_grad_(True)
+
+        camParams = [
+            {'params': [c2w_ts], 'lr': 0.01, "name": "c2w_t"},
+            {'params': [c2w_quats], 'lr': 0.01, "name": "c2w_quats"}
+            ] 
+
+        cam_optimizer = torch.optim.Adam(camParams, lr=0.0, eps=1e-15)
+
+        w2cAll = self.c2w_to_w2c(c2w_quats, c2w_ts)
+        """
 
         if self._bar is None:
-            self._bar = tqdm(range(iteration, self.opt.iterations+1), desc="Training progress")
+            self._bar = tqdm(range(self._gs_iter, self.opt.iterations+1), desc="Training progress")
 
         for _ in range(once_iterations):
             if self._gs_iter == self.opt.iterations:
-                print(f"INFO: Training completely finished after {self.opt.iteration} iterations")
+                print(f"INFO: Training completely finished after {self.opt.iterations} iterations")
                 return
 
-            self.gaussians.update_learning_rate(iteration)
+            self.gaussians.update_learning_rate(self._gs_iter)
 
             # Every 1000 its we increase the levels of SH up to a maximum degree
-            if iteration % 1000 == 0:
+            if self._gs_iter % 1000 == 0:
                 self.gaussians.oneupSHdegree()
 
             # Pick a random Camera
             #TODO should remove
-            if isinstance(self.datasForTrainList, dict):
-                key = random.choice(list(self.datasForTrainList.keys()))
-                viewpoint_cam = self.datasForTrainList[key] 
+            if isinstance(self.allDatasForTrain, dict):
+                key = random.choice(list(self.allDatasForTrain.keys()))
+                viewpoint_cam = self.allDatasForTrain[key] 
             
-                bg = torch.rand((3), device="cuda") if self.opt.random_background else self.background
+                bg = torch.rand((3), device=self.device) if self.opt.random_background else self.background
 
                 render_pkg = render(viewpoint_cam, self.gaussians, self.pipe, bg)
                 image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
@@ -476,18 +570,18 @@ class GaussianSplatRunner:
                     depth_gt = None
 
             else:
-                idx = random.randint(0, len(self.datasForTrainList)-1)
-                data = self.datasForTrainList[idx]
+                idx = random.randint(0, len(self.allDatasForTrain)-1)
+                data = self.allDatasForTrain[idx]
                 gt_image = data['color'].cuda()
                 mask = data['mask'].bool() if data['mask'] is not None else None
                 depth_gt = data['depth'].cuda() if data['depth'] is not None else None
 
                 cam = data['cam']
 
-                #cam.viewmatrix.requires_grad_(True)
+                 
+                #self.gaussians.deactivate_grad()
                 render_pkg = renderer(cam, self.gaussians, self.pipe)
                 image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
-
 
             Ll2 = 0.
 
@@ -508,9 +602,9 @@ class GaussianSplatRunner:
 
             # TODO backward every 10 frames
             loss.backward()
-
+           
             if self.debug:
-                if iteration % 50 == 0:
+                if self._gs_iter % 100 == 0:
                     fig = plt.figure(figsize=(20,10))
                     plt.subplot(1, 2, 1); plt.imshow(depth.detach().cpu().squeeze().numpy()); plt.colorbar(); plt.axis('off'); plt.title('Rendered Depth')
                     plt.subplot(1, 2, 2); plt.imshow(depth_gt.detach().cpu().squeeze().numpy()-depth.detach().cpu().squeeze().numpy()); plt.colorbar(); plt.axis('off'); plt.title('Depth diff')
@@ -532,7 +626,7 @@ class GaussianSplatRunner:
 
                     # add iter num on the corner
                     # Add text to the image
-                    text = f"Iteration: {iteration} Loss: {float(loss):.6f}"
+                    text = f"Iteration: {self._gs_iter} Loss: {float(loss):.6f}"
                     font = cv2.FONT_HERSHEY_SIMPLEX
                     font_scale = 1
                     font_thickness = 2
@@ -541,7 +635,7 @@ class GaussianSplatRunner:
 
                     cv2.putText(images, text, text_position, font, font_scale, text_color, font_thickness)
                     # live show
-                    if True:
+                    if False:
                         cv2.imshow("Diff", images)
 
                         # Check for key press
@@ -556,7 +650,7 @@ class GaussianSplatRunner:
                             os.mkdir(save_path)
                             print("Directory created successfully.")
 
-                        fn = f"debug_images/image_iter_{iteration:06d}.jpg"
+                        fn = f"debug_images/image_iter_{self._gs_iter:06d}.jpg"
                         cv2.imwrite(fn, images)
 
 
@@ -567,44 +661,42 @@ class GaussianSplatRunner:
             with torch.no_grad():
                 # Progress bar
                 ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-                if iteration % 10 == 0:
+                if self._gs_iter % 10 == 0:
                     self._bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                     self._bar.update(10)
-                if iteration == self.opt.iterations:
+                if self._gs_iter == self.opt.iterations:
                     self._bar.close()
 
                 # save
-                if (iteration in self.opt.save_pcd_iterations):
-                   print("\n[ITER {}] Saving Gaussians".format(iteration))
-                   point_cloud_path = os.path.join(self.opt.save_path, "point_cloud/iteration_{}".format(iteration))
+                if (self._gs_iter in self.opt.save_pcd_iterations):
+                   print("\n[ITER {}] Saving Gaussians".format(self._gs_iter))
+                   point_cloud_path = os.path.join(self.opt.save_path, "point_cloud/iteration_{}".format(self._gs_iter))
                    self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
 
                 # Densification
-                if iteration < self.opt.densify_until_iter:
+                if self._gs_iter < self.opt.densify_until_iter:
                     # Keep track of max radii in image-space for pruning
                     self.gaussians.max_radii2D[visibility_filter] = torch.max(self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                     self.gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                     # TODO computation of scene.cameras_extent is not trival
-                    if iteration > self.opt.densify_from_iter and iteration % self.opt.densification_interval == 0:
-                        size_threshold = 20 if iteration > self.opt.opacity_reset_interval else None
+                    if self._gs_iter > self.opt.densify_from_iter and self._gs_iter % self.opt.densification_interval == 0:
+                        size_threshold = 20 if self._gs_iter > self.opt.opacity_reset_interval else None
                         self.gaussians.densify_and_prune(self.opt.densify_grad_threshold, 0.005, self._cameras_radius, size_threshold)
-                    if iteration % self.opt.opacity_reset_interval == 0 or (self.cfg['white_background'] and iteration == self.opt.densify_from_iter):
+                    if self._gs_iter % self.opt.opacity_reset_interval == 0 or (self.cfg['white_background'] and self._gs_iter == self.opt.densify_from_iter):
                         self.gaussians.reset_opacity()
 
                 # Optimizer step
-                if iteration < self.opt.iterations:
+                if self._gs_iter < self.opt.iterations:
                     self.gaussians.optimizer.step()
                     self.gaussians.optimizer.zero_grad(set_to_none = True)
 
-                if (iteration in self.opt.save_ck_iterations):
-                    print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                    torch.save((self.gaussians.capture(), iteration), self.opt.save_path + "/checkpoint_" + str(iteration) + ".pth")
+                if (self._gs_iter in self.opt.save_ck_iterations):
+                    print("\n[ITER {}] Saving Checkpoint".format(self._gs_iter))
+                    torch.save((self.gaussians.capture(), self._gs_iter), self.opt.save_path + "/checkpoint_" + str(self._gs_iter) + ".pth")
 
-            iteration += 1
+            self._gs_iter += 1
 
-        # update iteration
-        self._gs_iter = iteration
 
     
 

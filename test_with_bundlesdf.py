@@ -5,7 +5,7 @@ import yaml
 import cv2
 import open3d as o3d
 import matplotlib.pyplot as plt
-from gs_runner_old import GaussianSplatRunner
+from gs_runner import GaussianSplatRunner
 
 # load all .npy
 folder_path = '/home/yjin/repos/BundleSDF/final_datas' 
@@ -36,7 +36,7 @@ run = wandb.init(
     name="naive-GS-bundlesdf-datasets-new-renderer",
     # Track hyperparameters and run metadata
     settings=wandb.Settings(start_method="fork"),
-    #mode='disabled'
+    mode='disabled'
 )
 
 
@@ -132,7 +132,6 @@ pcdAll = preprocess_datas(rgbs, depths, masks, glcam_in_obs)
 
 #gsRunner = GaussianSplatRunner(cfg, colors=rgbs, depths=depths, masks=masks, poses=glcam_in_obs, frame_ids=frameIds, K=K, point_cloud=pcdAll, wandb=run)
 gsRunner = GaussianSplatRunner(cfg, colors=rgbs, depths=depths, masks=masks, poses=glcam_in_obs, frame_ids=frameIds, K=K, wandb=run)
-
 gsRunner.train()
 
 

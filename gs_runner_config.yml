@@ -21,13 +21,8 @@ train:
   random_background: False
   save_path: "./output"
   save_pcd_iterations:
-    - 3_000
-    - 10_000
-    - 20_000
     - 30_000
   save_ck_iterations:
-    - 10_000
-    - 20_000
     - 30_000
 
 pipeline:
@@ -38,7 +33,7 @@ use_octree: False
 use_wandb: False 
 device: 'cuda:0'
 white_background: False
-debug: True 
+debug: False 
 ip: '127.0.0.1'
 port: 6009
 down_scale_ratio: 1.0
