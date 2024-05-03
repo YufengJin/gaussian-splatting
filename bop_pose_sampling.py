@@ -14,7 +14,7 @@ bproc.init()
 # load specified bop objects into the scene
 bop_objs = bproc.loader.load_bop_objs(bop_dataset_path=os.path.join(args.bop_parent_path, args.bop_dataset_name),
                                       mm2m=True,
-                                      obj_ids=[5])
+                                      obj_ids=[11])
 
 # load BOP datset intrinsics
 bproc.loader.load_bop_intrinsics(bop_dataset_path=os.path.join(args.bop_parent_path, args.bop_dataset_name))
@@ -25,10 +25,24 @@ for j, obj in enumerate(bop_objs):
 
 # sample point light on shell
 light_point = bproc.types.Light()
-light_point.set_type('AREA')
-light_point.set_energy(5)
+light_point.set_type('SUN')
+light_point.set_energy(80)
 location = bproc.sampler.shell(center=[0, 0, -0.8], radius_min=1, radius_max=2,
-                               elevation_min=40, elevation_max=89, uniform_volume=False)
+                               elevation_min=10, elevation_max=70, uniform_volume=False)
+light_point.set_location(location)
+
+light_point = bproc.types.Light()
+light_point.set_type('POINT')
+light_point.set_energy(100)
+location = bproc.sampler.shell(center=[0, 0, -0.8], radius_min=1, radius_max=2,
+                               elevation_min=10, elevation_max=70, uniform_volume=False)
+light_point.set_location(location)
+
+light_point = bproc.types.Light()
+light_point.set_type('POINT')
+light_point.set_energy(100)
+location = bproc.sampler.shell(center=[0, 0, -0.8], radius_min=1, radius_max=2,
+                               elevation_min=10, elevation_max=70, uniform_volume=False)
 light_point.set_location(location)
 
 
@@ -49,7 +63,7 @@ bproc.renderer.enable_segmentation_output(map_by=["category_id", "instance", "na
                                           default_values={"category_id": 0, "bop_dataset_name": None})
 
 # Render five different scenes
-for _ in range(10):
+for _ in range(1):
 
     # Sample object poses and check collisions 
     #bproc.object.sample_poses(objects_to_sample=bop_objs,
@@ -61,10 +75,10 @@ for _ in range(10):
 
     poses = 0
     # Render two camera poses
-    while poses < 5:
+    while poses < 100:
         # Sample location
         location = bproc.sampler.shell(center=[0, 0, 0],
-                                       radius_min=1,
+                                       radius_min=0.7,
                                        radius_max=1.2,
                                        elevation_min=1,
                                        elevation_max=89,
@@ -97,10 +111,10 @@ for _ in range(10):
                            append_to_existing_output=True)
 
     # Write data to coco format
-    bproc.writer.write_coco_annotations(os.path.join(args.output_dir, 'coco_data'),
-                                        supercategory=args.bop_dataset_name,
-                                        instance_segmaps=data["instance_segmaps"],
-                                        instance_attribute_maps=data["instance_attribute_maps"],
-                                        colors=data["colors"],
-                                        color_file_format="JPEG",
-                                        append_to_existing_output=True)
+    #bproc.writer.write_coco_annotations(os.path.join(args.output_dir, 'coco_data'),
+    #                                    supercategory=args.bop_dataset_name,
+    #                                    instance_segmaps=data["instance_segmaps"],
+    #                                    instance_attribute_maps=data["instance_attribute_maps"],
+    #                                    colors=data["colors"],
+    #                                    color_file_format="JPEG",
+    #                                    append_to_existing_output=True)
