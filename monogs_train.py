@@ -13,7 +13,8 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render, network_gui, monogs_render
+from scene.cameras import MonoGSCamera
 import sys
 import cv2
 import numpy as np
@@ -26,6 +27,12 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import wandb
 
+# matplotlib visualizations
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+from matplotlib.colors import Normalize
+
+
 # start a new experiment
 #wandb.init(project="gaussian-splatting-model")
 
@@ -34,6 +41,44 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+def from_Cam_to_MonoGSCam(cam):
+    idx = cam.uid
+    gt_color = cam.original_image
+    gt_depth = None
+    fx = cam.FoVx
+    fy = cam.FoVy
+    cx = cam.image_width / 2
+    cy = cam.image_height / 2
+    fovx = cam.FoVx
+    fovy = cam.FoVy
+    height = cam.image_height
+    width = cam.image_width
+    device = cam.data_device
+    projection_matrix = cam.projection_matrix
+    R = cam.R
+    T = cam.T
+    gt_pose = torch.eye(4, device=device)
+    gt_pose[:3, :3] = torch.tensor(R).to(device)
+    gt_pose[:3, 3] = torch.tensor(T).to(device)
+    
+    return MonoGSCamera(
+            idx,
+            gt_color,
+            gt_depth,
+            gt_pose,
+            projection_matrix,
+            fx,
+            fy,
+            cx,
+            cy,
+            fovx,
+            fovy,
+            height,
+            width,
+            device=device,
+        )
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
@@ -84,17 +129,51 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
+        viewpoint = from_Cam_to_MonoGSCam(viewpoint_cam)
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        opt_params = []
+        opt_params.append(
+            {
+                "params": [viewpoint.cam_rot_delta],
+                "lr": 0.01, 
+                "name": "rot_{}".format(viewpoint.uid),
+            }
+        )
+        opt_params.append(
+            {
+                "params": [viewpoint.cam_trans_delta],
+                "lr": 0.001,
+                "name": "trans_{}".format(viewpoint.uid),
+            }
+        )
+        opt_params.append(
+            {
+                "params": [viewpoint.exposure_a],
+                "lr": 0.01,
+                "name": "exposure_a_{}".format(viewpoint.uid),
+            }
+        )
+        opt_params.append(
+            {
+                "params": [viewpoint.exposure_b],
+                "lr": 0.01,
+                "name": "exposure_b_{}".format(viewpoint.uid),
+            }
+        )
 
+        #pose_optimizer = torch.optim.Adam(opt_params)
+
+        
+        render_pkg = monogs_render(viewpoint, gaussians, pipe, bg)
+        image, viewspace_point_tensor, visibility_filter, radii, depth, opacity= render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"], render_pkg["opacity"]
+        
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint.original_image.cuda()
 
         # TODO test mask backpropagation, understand ssim loss
         mask = gt_image.ge(1e-5)
@@ -113,6 +192,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             images = np.hstack((gt_image_np, image_np))
             images = cv2.cvtColor(images, cv2.COLOR_BGR2RGB)
 
+            depth_img = depth.detach().cpu().squeeze().numpy()
+            # normalize depth image to 0,1
+            depth_img = depth_img - np.min(depth_img) / (np.max(depth_img) - np.min(depth_img))
+            color_map = plt.get_cmap('viridis')  # You can change 'viridis' to other color maps
+            depth_img = color_map(depth_img)[..., :3]
+
+            opacity_img = opacity.detach().cpu().squeeze().numpy()
+            # normalize opacity image to 0,1
+            opacity_img = opacity_img - np.min(opacity_img) / (np.max(opacity_img) - np.min(opacity_img))
+            color_map = plt.get_cmap('viridis')  # You can change 'viridis' to other color maps
+            opacity_img = color_map(opacity_img)[..., :3]
+
+            depth_opa_imgs = np.hstack((depth_img, opacity_img))
+            images = np.vstack((images, depth_opa_imgs))
+            
             text = f"Mapping Iteration: {iteration} Loss: {loss.item():.6f}"
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 1
@@ -128,8 +222,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             key = cv2.waitKey(30) & 0xFF
             if key == ord('q'):  # Press 'q' to quit
                 break
-
-
 
 
         if iteration % 1000 == 0:

@@ -11,12 +11,13 @@
 
 import os
 import torch
+import torch.optim as optim
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
-import sys
-import cv2
 import numpy as np
+import cv2
+from gaussian_renderer import render, network_gui, icomma_render
+import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
@@ -24,11 +25,24 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from scene.cameras import Camera_Pose
 import wandb
 
 # start a new experiment
 #wandb.init(project="gaussian-splatting-model")
-
+def create_differentiable_camera_from_viewpoint(viewpoint_cam, add_init_noise = False, requires_grad = False):
+    if add_init_noise:
+        start_pose_w2c = viewpoint_cam.world_view_transform.cuda()
+        start_noise = torch.randn(3, 4,  device="cuda") * 0.01
+        start_pose_w2c[:3, :4] += start_noise
+    else:
+        start_pose_w2c = viewpoint_cam.world_view_transform.cuda()
+    fov_x = viewpoint_cam.FoVx
+    fov_y = viewpoint_cam.FoVy
+    image_width =  viewpoint_cam.image_width
+    image_height = viewpoint_cam.image_height
+    return Camera_Pose(start_pose_w2c,FoVx=fov_x,FoVy=fov_y,
+                       image_width=image_width,image_height=image_height, requires_grad=requires_grad)
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -55,6 +69,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+
     for iteration in range(first_iter, opt.iterations + 1):        
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -90,19 +105,72 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+#        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+#        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+# 
+        if iteration > 30000:
+            camera_pose = create_differentiable_camera_from_viewpoint(viewpoint_cam, add_init_noise = True, requires_grad = True)
+            camera_pose.cuda()
+            gaussians.deactivate_grad()
+            optimizer = optim.Adam(camera_pose.parameters(),lr = 0.001) 
+            #optimizer.zero_grad()
 
-        # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
+            for i in range(1):
+                render_pkg = icomma_render(camera_pose, gaussians, pipe, bg, compute_grad_cov2d=True)
+                image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+                gt_image = viewpoint_cam.original_image.cuda()
+                mask = gt_image.ge(1e-5)
+                Ll1 = l1_loss(torch.masked_select(image, mask), torch.masked_select(gt_image, mask))
+                Lssim = ssim(image, gt_image)
+                loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - Lssim)
 
-        # TODO test mask backpropagation, understand ssim loss
-        mask = gt_image.ge(1e-5)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                # if i % 5 == 0:
+                #     gt_image_np = gt_image.detach().cpu().numpy().transpose(1, 2, 0)
+                #     image_np    = image.detach().cpu().numpy().transpose(1, 2, 0)
+                #     gt_image_np = (gt_image_np * 255).astype(np.uint8)
+                #     image_np = (image_np * 255).astype(np.uint8)
+                #     images = np.hstack((gt_image_np, image_np))
+                #     images = cv2.cvtColor(images, cv2.COLOR_BGR2RGB)
+    
+                #     text = f"Tracking iteration: {i}, Mapping Iteration: {iteration} Loss: {loss.item():.6f}"
+                #     font = cv2.FONT_HERSHEY_SIMPLEX
+                #     font_scale = 1
+                #     font_thickness = 2
+                #     text_color = (255, 255, 255)  # White color
+                #     text_position = (50, 50)
+    
+                #     cv2.putText(images, text, text_position, font, font_scale, text_color, font_thickness)
+    
+                #     cv2.imshow("Diff", images)
+    
+                #     # Check for key press
+                #     key = cv2.waitKey(30) & 0xFF
+                #     if key == ord('q'):  # Press 'q' to quit
+                #         break
 
-        Ll1 = l1_loss(torch.masked_select(image, mask), torch.masked_select(gt_image, mask))
-        Lssim = ssim(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - Lssim)
-        loss.backward()
+
+                print(f"iter {i} loss {loss.item()} Ll1 {Ll1.item()} Lssim {Lssim.item()}")
+
+        else:
+            camera_pose = create_differentiable_camera_from_viewpoint(viewpoint_cam)
+            camera_pose.cuda()
+            # icomma rendering
+            render_pkg = icomma_render(camera_pose, gaussians, pipe, bg, compute_grad_cov2d=True)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+#
+            # Loss
+            gt_image = viewpoint_cam.original_image.cuda()
+
+            # TODO test mask backpropagation, understand ssim loss
+            mask = gt_image.ge(1e-5)
+
+            Ll1 = l1_loss(torch.masked_select(image, mask), torch.masked_select(gt_image, mask))
+            Lssim = ssim(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - Lssim)
+            loss.backward()
 
         #wandb.log({"total": loss, "l1": Ll1, "d-simm": Lssim})
         if iteration % 10 == 0:
@@ -136,8 +204,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gt_image_np = gt_image.detach().cpu().numpy()
             image_np    = image.detach().cpu().numpy()
 
-
-
         iter_end.record()
 
         with torch.no_grad():
@@ -170,8 +236,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
+            #if iteration < 100:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
