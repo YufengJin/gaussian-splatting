@@ -23,6 +23,7 @@ from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+from utils.pose_utils import update_pose
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import wandb
@@ -46,38 +47,40 @@ def from_Cam_to_MonoGSCam(cam):
     idx = cam.uid
     gt_color = cam.original_image
     gt_depth = None
-    fx = cam.FoVx
-    fy = cam.FoVy
-    cx = cam.image_width / 2
-    cy = cam.image_height / 2
     fovx = cam.FoVx
     fovy = cam.FoVy
     height = cam.image_height
     width = cam.image_width
     device = cam.data_device
-    projection_matrix = cam.projection_matrix
     R = cam.R
     T = cam.T
+
+    #trans = np.array([0.0, 0.0, 0.5])
+    #scale = 2.0
+    T += (np.random.rand(3) - 0.5) * 2 * 0.1   # translation noise (-0.02, 0.02)
+    R = R @ cv2.Rodrigues((np.random.rand(3) - 0.5) * 2 * 5 / 180 * np.pi)[0] 
+
+    T = torch.tensor(T)
+    R = torch.tensor(R)
     gt_pose = torch.eye(4, device=device)
     gt_pose[:3, :3] = torch.tensor(R).to(device)
     gt_pose[:3, 3] = torch.tensor(T).to(device)
     
-    return MonoGSCamera(
+    cam = MonoGSCamera(
             idx,
             gt_color,
             gt_depth,
             gt_pose,
-            projection_matrix,
-            fx,
-            fy,
-            cx,
-            cy,
             fovx,
             fovy,
             height,
             width,
             device=device,
         )
+
+    cam.update_RT(R, T)
+    return cam
+    
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -130,6 +133,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         viewpoint = from_Cam_to_MonoGSCam(viewpoint_cam)
+        #print("///////////////////////// DEBUG ///////////////////////////////")
+        #print("viewpoint_cam: ")
+        #print("\tviewpoint_cam.R: \n", viewpoint_cam.R)
+        #print("\tviewpoint.R: \n", viewpoint.R)
+        #print("\tviewpoint_cam.T: ", viewpoint_cam.T)
+        #print("\tviewpoint.T: ", viewpoint.T)
+        #print("\tviewpoint_cam.FoVx: ", viewpoint_cam.FoVx)
+        #print("\tviewpoint.FoVx: ", viewpoint.FoVx)
+        #print("\tviewpoint_cam.FoVy: ", viewpoint_cam.FoVy)
+        #print("\tviewpoint.FoVy: ", viewpoint.FoVy)
+        #print("\tviewpoint_cam.world_view_transform: \n", viewpoint_cam.world_view_transform)
+        #print("\tviewpoint.world_view_transform: \n", viewpoint.world_view_transform)
+        #print("\tviewpoint_cam.projection_matrix: \n", viewpoint_cam.projection_matrix)
+        #print("\tviewpoint.projection_matrix: \n", viewpoint.projection_matrix)
+        #print("\tviewpoint_cam.full_proj_transform: \n", viewpoint_cam.full_proj_transform)
+        #print("\tviewpoint.full_proj_transform: \n", viewpoint.full_proj_transform)
+        #print("\tviewpoint_cam.camera_center: ", viewpoint_cam.camera_center)
+        #print("\tviewpoint.camera_center: ", viewpoint.camera_center)
+
+        #print("///////////////////////// DEBUG ///////////////////////////////")
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
@@ -166,108 +189,135 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             }
         )
 
-        #pose_optimizer = torch.optim.Adam(opt_params)
+        pose_optimizer = torch.optim.Adam(opt_params)
 
+        for pose_iter in range(80):
+            render_pkg = monogs_render(viewpoint, gaussians, pipe, bg)
+            image, viewspace_point_tensor, visibility_filter, radii, depth, opacity= render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"], render_pkg["opacity"]
         
-        render_pkg = monogs_render(viewpoint, gaussians, pipe, bg)
-        image, viewspace_point_tensor, visibility_filter, radii, depth, opacity= render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"], render_pkg["opacity"]
+            # Loss
+            viewpoint.compute_grad_mask()
+            breakpoint()
+            gt_image = viewpoint.original_image.cuda()
+
+            # TODO test mask backpropagation, understand ssim loss
+            #mask = gt_image.ge(1e-5)
+
+            #Ll1 = l1_loss(torch.masked_select(image, mask), torch.masked_select(gt_image, mask))
+            Ll1 = l1_loss(image, gt_image)
+            Lssim = ssim(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - Lssim)
+
+            pose_optimizer.zero_grad()
+            loss.backward()
+            with torch.no_grad():
+                 pose_optimizer.step()
+                 converged = update_pose(viewpoint)
+
+            if converged:
+                break   
+
+            #wandb.log({"total": loss, "l1": Ll1, "d-simm": Lssim})
+            if pose_iter % 5 == 0: 
+                gt_image_np = gt_image.detach().cpu().numpy().transpose(1, 2, 0)
+                image_np    = image.detach().cpu().numpy().transpose(1, 2, 0)
+                gt_image_np = (gt_image_np * 255).astype(np.uint8)
+                image_np = (image_np * 255).astype(np.uint8)
+                images = np.hstack((gt_image_np, image_np))
+                images = cv2.cvtColor(images, cv2.COLOR_BGR2RGB)
+
+                black = np.zeros_like(image_np)
+                image_diff = np.abs(gt_image_np - image_np).astype(np.uint8)
+                image_diff = np.hstack((black, image_diff))
+                images = np.vstack((images, image_diff))
+
+                # depth_img = depth.detach().cpu().squeeze().numpy()
+                # # normalize depth image to 0,1
+                # depth_img = depth_img - np.min(depth_img) / (np.max(depth_img) - np.min(depth_img))
+                # color_map = plt.get_cmap('viridis')  # You can change 'viridis' to other color maps
+                # depth_img = color_map(depth_img)[..., :3]
+
+                # opacity_img = opacity.detach().cpu().squeeze().numpy()
+                # # normalize opacity image to 0,1
+                # opacity_img = opacity_img - np.min(opacity_img) / (np.max(opacity_img) - np.min(opacity_img))
+                # color_map = plt.get_cmap('viridis')  # You can change 'viridis' to other color maps
+                # opacity_img = color_map(opacity_img)[..., :3]
+
+                # depth_opa_imgs = np.hstack((depth_img, opacity_img))
+                # depth_opa_imgs = (depth_opa_imgs * 255).astype(np.uint8)
+                # images = np.vstack((images, depth_opa_imgs))
+
+                text = f"Mapping Iteration: {iteration} Loss: {loss.item():.6f}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 1
+                font_thickness = 2
+                text_color = (255, 255, 255)  # White color
+                text_position = (50, 50)
+
+                cv2.putText(images, text, text_position, font, font_scale, text_color, font_thickness)
+
+                images = images[::2, ::2, :]
+                cv2.imshow("Diff", images)
+
+                # Check for key press
+                key = cv2.waitKey(30) & 0xFF
+                if key == ord('q'):  # Press 'q' to quit
+                    break
+
+        continue
+        for mapping_iter in range(80):
+            render_pkg = monogs_render(viewpoint, gaussians, pipe, bg)
+            image, viewspace_point_tensor, visibility_filter, radii, depth, opacity= render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"], render_pkg["opacity"]
         
-        # Loss
-        gt_image = viewpoint.original_image.cuda()
+            # Loss
+            gt_image = viewpoint.original_image.cuda()
 
-        # TODO test mask backpropagation, understand ssim loss
-        mask = gt_image.ge(1e-5)
+            # TODO test mask backpropagation, understand ssim loss
+            #mask = gt_image.ge(1e-5)
 
-        Ll1 = l1_loss(torch.masked_select(image, mask), torch.masked_select(gt_image, mask))
-        Lssim = ssim(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - Lssim)
-        loss.backward()
+            #Ll1 = l1_loss(torch.masked_select(image, mask), torch.masked_select(gt_image, mask))
+            Ll1 = l1_loss(image, gt_image)
+            Lssim = ssim(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - Lssim)
 
-        #wandb.log({"total": loss, "l1": Ll1, "d-simm": Lssim})
-        if iteration % 10 == 0:
-            gt_image_np = gt_image.detach().cpu().numpy().transpose(1, 2, 0)
-            image_np    = image.detach().cpu().numpy().transpose(1, 2, 0)
-            gt_image_np = (gt_image_np * 255).astype(np.uint8)
-            image_np = (image_np * 255).astype(np.uint8)
-            images = np.hstack((gt_image_np, image_np))
-            images = cv2.cvtColor(images, cv2.COLOR_BGR2RGB)
+            loss.backward()
 
-            depth_img = depth.detach().cpu().squeeze().numpy()
-            # normalize depth image to 0,1
-            depth_img = depth_img - np.min(depth_img) / (np.max(depth_img) - np.min(depth_img))
-            color_map = plt.get_cmap('viridis')  # You can change 'viridis' to other color maps
-            depth_img = color_map(depth_img)[..., :3]
+            with torch.no_grad():
+                # Progress bar
+                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+                if iteration % 10 == 0:
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                    progress_bar.update(10)
+                if iteration == opt.iterations:
+                    progress_bar.close()
 
-            opacity_img = opacity.detach().cpu().squeeze().numpy()
-            # normalize opacity image to 0,1
-            opacity_img = opacity_img - np.min(opacity_img) / (np.max(opacity_img) - np.min(opacity_img))
-            color_map = plt.get_cmap('viridis')  # You can change 'viridis' to other color maps
-            opacity_img = color_map(opacity_img)[..., :3]
+                # Log and save
+                #training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+                if (iteration in saving_iterations):
+                    print("\n[ITER {}] Saving Gaussians".format(iteration))
+                    scene.save(iteration)
 
-            depth_opa_imgs = np.hstack((depth_img, opacity_img))
-            images = np.vstack((images, depth_opa_imgs))
-            
-            text = f"Mapping Iteration: {iteration} Loss: {loss.item():.6f}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 1
-            font_thickness = 2
-            text_color = (255, 255, 255)  # White color
-            text_position = (50, 50)
+                # Densification
+                if iteration < opt.densify_until_iter:
+                    # Keep track of max radii in image-space for pruning
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-            cv2.putText(images, text, text_position, font, font_scale, text_color, font_thickness)
+                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
 
-            cv2.imshow("Diff", images)
+                    if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                        gaussians.reset_opacity()
 
-            # Check for key press
-            key = cv2.waitKey(30) & 0xFF
-            if key == ord('q'):  # Press 'q' to quit
-                break
+                # Optimizer step
+                if iteration < opt.iterations:
+                    gaussians.optimizer.step()
+                    gaussians.optimizer.zero_grad(set_to_none = True)
 
-
-        if iteration % 1000 == 0:
-            gt_image_np = gt_image.detach().cpu().numpy()
-            image_np    = image.detach().cpu().numpy()
-
-
-
-        iter_end.record()
-
-        with torch.no_grad():
-            # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
-
-            # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
-
-            # Densification
-            if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
-
-            # Optimizer step
-            if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
-
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                if (iteration in checkpoint_iterations):
+                    print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                    torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -338,10 +388,10 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 3_000, 7_000, 15_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 15_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[3_000, 15_000, 30_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

@@ -12,8 +12,8 @@
 import torch
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from icomma_diff_gaussian_rasterization import GaussianRasterizationSettings as iCommaGaussianRasterizationSettings
-from icomma_diff_gaussian_rasterization import GaussianRasterizer as iCommaGaussianRasterizer
+# from icomma_diff_gaussian_rasterization import GaussianRasterizationSettings as iCommaGaussianRasterizationSettings
+# from icomma_diff_gaussian_rasterization import GaussianRasterizer as iCommaGaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
