@@ -27,15 +27,40 @@ from utils.pose_utils import update_pose
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import wandb
-
+import kornia as ki
 # matplotlib visualizations
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 from matplotlib.colors import Normalize
-
-
+import open3d as o3d
+import io
 # start a new experiment
 #wandb.init(project="gaussian-splatting-model")
+
+def compute_edge_loss(image, gt_image):
+    assert isinstance(image, torch.Tensor) and isinstance(gt_image, torch.Tensor)
+
+    gt_gray = ki.color.rgb_to_grayscale(gt_image.unsqueeze(0))
+    gray = ki.color.rgb_to_grayscale(image.unsqueeze(0))
+
+    t = ki.filters.sobel(gt_gray).squeeze(0)
+    e = ki.filters.sobel(gray).squeeze(0)
+
+    return torch.abs(t - e).mean(), t, e
+
+# define a function which returns an image as numpy array from figure
+def get_img_from_fig(fig, dpi=180, BGR2RGB=False):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi)
+    buf.seek(0)
+    img_arr = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+    buf.close()
+    img = cv2.imdecode(img_arr, 1)
+    if BGR2RGB:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    return img
+
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -43,7 +68,7 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def from_Cam_to_MonoGSCam(cam):
+def from_Cam_to_MonoGSCam(cam, noised=False):
     idx = cam.uid
     gt_color = cam.original_image
     gt_depth = None
@@ -55,16 +80,19 @@ def from_Cam_to_MonoGSCam(cam):
     R = cam.R
     T = cam.T
 
+    gt_pose = np.eye(4)
+    gt_pose[:3, :3] = R
+    gt_pose[:3, 3] = T
+
     #trans = np.array([0.0, 0.0, 0.5])
     #scale = 2.0
-    T += (np.random.rand(3) - 0.5) * 2 * 0.1   # translation noise (-0.02, 0.02)
-    R = R @ cv2.Rodrigues((np.random.rand(3) - 0.5) * 2 * 5 / 180 * np.pi)[0] 
+    if noised:
+        T += (np.random.rand(3) - 0.5) * 2 * 0.3   # translation noise (-0.02, 0.02)
+        R = R @ cv2.Rodrigues((np.random.rand(3) - 0.5) * 2 * 5 / 180 * np.pi)[0] 
 
-    T = torch.tensor(T)
-    R = torch.tensor(R)
-    gt_pose = torch.eye(4, device=device)
-    gt_pose[:3, :3] = torch.tensor(R).to(device)
-    gt_pose[:3, 3] = torch.tensor(T).to(device)
+    # R, T to torch tensors
+    R = torch.tensor(R, device=device)
+    T = torch.tensor(T, device=device)
     
     cam = MonoGSCamera(
             idx,
@@ -81,8 +109,6 @@ def from_Cam_to_MonoGSCam(cam):
     cam.update_RT(R, T)
     return cam
     
-
-
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -132,32 +158,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        viewpoint = from_Cam_to_MonoGSCam(viewpoint_cam)
-        #print("///////////////////////// DEBUG ///////////////////////////////")
-        #print("viewpoint_cam: ")
-        #print("\tviewpoint_cam.R: \n", viewpoint_cam.R)
-        #print("\tviewpoint.R: \n", viewpoint.R)
-        #print("\tviewpoint_cam.T: ", viewpoint_cam.T)
-        #print("\tviewpoint.T: ", viewpoint.T)
-        #print("\tviewpoint_cam.FoVx: ", viewpoint_cam.FoVx)
-        #print("\tviewpoint.FoVx: ", viewpoint.FoVx)
-        #print("\tviewpoint_cam.FoVy: ", viewpoint_cam.FoVy)
-        #print("\tviewpoint.FoVy: ", viewpoint.FoVy)
-        #print("\tviewpoint_cam.world_view_transform: \n", viewpoint_cam.world_view_transform)
-        #print("\tviewpoint.world_view_transform: \n", viewpoint.world_view_transform)
-        #print("\tviewpoint_cam.projection_matrix: \n", viewpoint_cam.projection_matrix)
-        #print("\tviewpoint.projection_matrix: \n", viewpoint.projection_matrix)
-        #print("\tviewpoint_cam.full_proj_transform: \n", viewpoint_cam.full_proj_transform)
-        #print("\tviewpoint.full_proj_transform: \n", viewpoint.full_proj_transform)
-        #print("\tviewpoint_cam.camera_center: ", viewpoint_cam.camera_center)
-        #print("\tviewpoint.camera_center: ", viewpoint.camera_center)
+        viewpoint = from_Cam_to_MonoGSCam(viewpoint_cam, noised=True)
+        viewpoint_raw = from_Cam_to_MonoGSCam(viewpoint_cam, noised=False)
 
-        #print("///////////////////////// DEBUG ///////////////////////////////")
+
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
+
+        with torch.no_grad():
+            render_pkg = monogs_render(viewpoint_raw, gaussians, pipe, bg)
+            depth_gt = render_pkg["depth"]
 
         opt_params = []
         opt_params.append(
@@ -194,10 +207,93 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         for pose_iter in range(80):
             render_pkg = monogs_render(viewpoint, gaussians, pipe, bg)
             image, viewspace_point_tensor, visibility_filter, radii, depth, opacity= render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"], render_pkg["opacity"]
-        
+
             # Loss
             viewpoint.compute_grad_mask()
-            breakpoint()
+            gt_image = viewpoint.original_image.cuda()
+
+            # TODO test mask backpropagation, understand ssim loss
+            #mask = gt_image.ge(1e-5)
+
+            depth_loss = torch.nn.functional.mse_loss(depth, depth_gt)
+
+            #Ll1 = l1_loss(torch.masked_select(image, mask), torch.masked_select(gt_image, mask))
+            Ll1 = l1_loss(image, gt_image)
+            Lssim = ssim(image, gt_image)
+
+            edge_loss, t, e = compute_edge_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - Lssim) #+ 2. * depth_loss + 2. * edge_loss
+            #loss = depth_loss
+            msg = f"Loss: {loss.item():.6f} L1: {Ll1.item():.6f} SSIM: {Lssim.item():.6f} Depth: {depth_loss.item():.6f} Edge: {edge_loss.item():.6f}"
+            print(msg)
+
+            pose_optimizer.zero_grad()
+            loss.backward()
+            with torch.no_grad():
+                pose_optimizer.step()
+                converged = update_pose(viewpoint)
+                 
+                gt_R = viewpoint.R_gt
+                gt_T = viewpoint.T_gt
+
+                R = viewpoint.R
+                T = viewpoint.T
+
+                # calculate the difference between the ground truth and the estimated pose
+                R_diff = torch.norm(gt_R - R)
+                T_diff = torch.norm(gt_T - T)
+                print(f"DEBUG: R_diff: {R_diff.item()} T_diff: {T_diff.item()}")
+
+
+            if converged:
+                break   
+
+            #wandb.log({"total": loss, "l1": Ll1, "d-simm": Lssim})
+            if pose_iter % 5 == 0: 
+                gt_im = gt_image.detach().cpu().numpy().transpose(1, 2, 0)
+                im    = image.detach().cpu().numpy().transpose(1, 2, 0)
+                depth_img = depth.detach().cpu().squeeze().numpy()
+                depth_gt_img = depth_gt.detach().cpu().squeeze().numpy()
+                edge = e.detach().cpu().squeeze().numpy()
+                edge_gt = t.detach().cpu().squeeze().numpy()
+
+                im_diff = np.clip(np.abs(gt_im - im), 0, 1)
+                depth_diff = np.abs(depth_img - depth_gt_img)
+                edge_diff = np.clip(np.abs(edge - edge_gt), 0, 1)
+
+                fig, ax = plt.subplots(3, 3, figsize=(10, 10))
+                ax[0, 0].imshow(gt_im); ax[0, 0].set_title("GT")
+                ax[0, 1].imshow(im); ax[0, 1].set_title("Render")
+                ax[0, 2].imshow(im_diff); ax[0, 2].set_title("Diff")
+                im = ax[1, 0].imshow(depth_img); ax[1, 0].set_title("Depth"); 
+                # set colorbar
+                fig.colorbar(im, ax=ax[1, 0], orientation='vertical')
+                im = ax[1, 1].imshow(depth_gt_img); ax[1, 1].set_title("GT Depth"); 
+                fig.colorbar(im, ax=ax[1, 1], orientation='vertical')
+                im = ax[1, 2].imshow(depth_diff); ax[1, 2].set_title("Depth Diff"); 
+                fig.colorbar(im, ax=ax[1, 2], orientation='vertical')
+                ax[2, 0].imshow(edge); ax[2, 0].set_title("Edge")
+                ax[2, 1].imshow(edge_gt); ax[2, 1].set_title("GT Edge")
+                ax[2, 2].imshow(edge_diff); ax[2, 2].set_title("Edge Diff")
+                fig.suptitle(msg)
+
+                img = get_img_from_fig(fig, dpi=180)
+                plt.close()
+                
+                img = img[::2, ::2, :]
+                cv2.imshow("DEBUG", img)
+
+                # Check for key press
+                key = cv2.waitKey(30) & 0xFF
+                if key == ord('q'):  # Press 'q' to quit
+                    break
+
+        for mapping_iter in range(0):
+            continue
+            render_pkg = monogs_render(viewpoint, gaussians, pipe, bg)
+            image, viewspace_point_tensor, visibility_filter, radii, depth, opacity= render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"], render_pkg["opacity"]
+        
+            # Loss
             gt_image = viewpoint.original_image.cuda()
 
             # TODO test mask backpropagation, understand ssim loss
@@ -208,17 +304,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Lssim = ssim(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - Lssim)
 
-            pose_optimizer.zero_grad()
             loss.backward()
-            with torch.no_grad():
-                 pose_optimizer.step()
-                 converged = update_pose(viewpoint)
 
-            if converged:
-                break   
-
-            #wandb.log({"total": loss, "l1": Ll1, "d-simm": Lssim})
-            if pose_iter % 5 == 0: 
+            if mapping_iter % 5 == 0: 
                 gt_image_np = gt_image.detach().cpu().numpy().transpose(1, 2, 0)
                 image_np    = image.detach().cpu().numpy().transpose(1, 2, 0)
                 gt_image_np = (gt_image_np * 255).astype(np.uint8)
@@ -263,25 +351,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 key = cv2.waitKey(30) & 0xFF
                 if key == ord('q'):  # Press 'q' to quit
                     break
-
-        continue
-        for mapping_iter in range(80):
-            render_pkg = monogs_render(viewpoint, gaussians, pipe, bg)
-            image, viewspace_point_tensor, visibility_filter, radii, depth, opacity= render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"], render_pkg["opacity"]
-        
-            # Loss
-            gt_image = viewpoint.original_image.cuda()
-
-            # TODO test mask backpropagation, understand ssim loss
-            #mask = gt_image.ge(1e-5)
-
-            #Ll1 = l1_loss(torch.masked_select(image, mask), torch.masked_select(gt_image, mask))
-            Ll1 = l1_loss(image, gt_image)
-            Lssim = ssim(image, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - Lssim)
-
-            loss.backward()
-
             with torch.no_grad():
                 # Progress bar
                 ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log

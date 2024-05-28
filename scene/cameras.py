@@ -13,7 +13,6 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix, se3_to_SE3, getWorld2View2_ts, image_gradient, image_gradient_mask
-from utils.pose_utils import SE3_exp 
 
 # Define a class named Camera_Pose. The code is based on the camera_transf class in iNeRF. You can refer to iNeRF at https://github.com/salykovaa/inerf.
 class Camera_Pose(nn.Module):
@@ -132,8 +131,7 @@ class MonoGSCamera(nn.Module):
         uid,
         color,
         depth,
-        R,
-        t,
+        gt_T,
         fovx,
         fovy,
         image_height,
@@ -146,8 +144,14 @@ class MonoGSCamera(nn.Module):
         self.uid = uid
         self.device = device
 
-        self.R = R.to(device) 
-        self.T = t.to(device)
+        T = torch.eye(4, device=device)
+        self.R = T[:3, :3]
+        self.T = T[:3, 3]
+
+        if not isinstance(gt_T, torch.Tensor):
+            gt_T = torch.tensor(gt_T, device=device)
+        self.R_gt = gt_T[:3, :3]
+        self.T_gt = gt_T[:3, 3]
 
         self.original_image = color.clamp(0.0, 1.0).to(device)
         self.depth = depth
@@ -216,24 +220,9 @@ class MonoGSCamera(nn.Module):
     def camera_center(self):
         return self.world_view_transform.inverse()[3, :3]
 
-    @torch.no_grad()
-    def step(self, converged_threshold=1e-4):
-        tau = torch.cat([self.cam_trans_delta, self.cam_rot_delta], axis=0)
-        
-        T_w2c = torch.eye(4, device=self.device)
-        T_w2c[0:3, 0:3] = self.R
-        T_w2c[0:3, 3] = self.T
-
-        new_w2c = SE3_exp(tau) @ T_w2c
-
-        self.R = new_w2c[0:3, 0:3]
-        self.T = new_w2c[0:3, 3]
-
-        self.cam_rot_delta.data.fill_(0)
-        self.cam_trans_delta.data.fill_(0)
-
-        converged = tau.norm() < converged_threshold
-        return converged
+    def update_RT(self, R, t):
+        self.R = R.to(self.device)
+        self.T = t.to(self.device)
 
     def compute_grad_mask(self, edge_threshold=1.1):
         gray_img = self.original_image.mean(dim=0, keepdim=True)

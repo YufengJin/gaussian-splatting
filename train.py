@@ -102,7 +102,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(torch.masked_select(image, mask), torch.masked_select(gt_image, mask))
         Lssim = ssim(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - Lssim)
+        breakpoint()
         loss.backward()
+        breakpoint()
 
         #wandb.log({"total": loss, "l1": Ll1, "d-simm": Lssim})
         if iteration % 10 == 0:
@@ -164,6 +166,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    breakpoint()
                     gaussians.reset_opacity()
 
             # Optimizer step
